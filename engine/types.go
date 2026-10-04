@@ -42,6 +42,36 @@ func (t OrderType) String() string {
 	}
 }
 
+// TimeInForce controls how long an order may stay live after submission.
+type TimeInForce int
+
+const (
+	// TIFGTC (good-til-canceled) is the default: a limit remainder rests in
+	// the book until filled or canceled. Market orders always behave as IOC.
+	TIFGTC TimeInForce = iota
+	// TIFIOC (immediate-or-cancel): fill whatever is matchable right now and
+	// cancel the remainder immediately; the order never rests and never
+	// reserves funds/shares beyond what actually fills.
+	TIFIOC
+	// TIFFOK (fill-or-kill): if the full quantity cannot be matched right
+	// now, the whole order is rejected with zero state change; otherwise it
+	// fills entirely in one shot and never rests.
+	TIFFOK
+)
+
+func (t TimeInForce) String() string {
+	switch t {
+	case TIFGTC:
+		return "GTC"
+	case TIFIOC:
+		return "IOC"
+	case TIFFOK:
+		return "FOK"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // OrderStatus is the lifecycle state of an order.
 type OrderStatus int
 
@@ -77,19 +107,28 @@ type Order struct {
 	Symbol      string
 	Side        Side
 	Type        OrderType
+	TIF         TimeInForce
 	Price       int64 // limit price; 0 for market orders
 	Qty         int64 // original quantity
 	OpenQty     int64 // unfilled quantity
 	FilledQty   int64
 	PrioritySeq int64 // global monotonic sequence defining time priority
 	CreatedAt   time.Time
+	// TerminalCancel marks that the order ended by cancellation (explicit
+	// cancel, or IOC/market remainder kill) rather than by filling out, so a
+	// partially filled canceled order is distinguishable from a filled one.
+	TerminalCancel bool
 }
 
 // Status derives the status of the order.
 func (o *Order) Status() OrderStatus {
 	switch {
+	case o.OpenQty == 0 && o.TerminalCancel:
+		return StatusCanceled
 	case o.OpenQty == 0 && o.FilledQty > 0:
 		return StatusFilled
+	case o.OpenQty == 0:
+		return StatusCanceled
 	case o.FilledQty > 0:
 		return StatusPartiallyFilled
 	default:
@@ -109,7 +148,8 @@ type OrderRequest struct {
 	Symbol  string
 	Side    Side
 	Type    OrderType
-	Price   int64 // required (positive) for limit orders; ignored for market
+	TIF     TimeInForce // zero value = TIFGTC (rest); market orders are IOC regardless
+	Price   int64       // required (positive) for limit orders; ignored for market
 	Qty     int64
 }
 
@@ -195,6 +235,7 @@ type Event struct {
 	Symbol  string
 	Side    Side
 	OType   OrderType
+	TIF     TimeInForce
 	Price   int64
 	Qty     int64
 	Reason  string // rejection reason (Rejected)

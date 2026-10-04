@@ -75,6 +75,16 @@ func main() {
 		{"carol limit-buys 5 AAA @96 -> fills the early o2 remainder first", func() {
 			submit(e, engine.OrderRequest{ID: "o5", Account: "carol", Symbol: "AAA", Side: engine.SideBuy, Type: engine.OrderTypeLimit, Price: 96, Qty: 5})
 		}},
+		{"carol IOC-buys 12 AAA @96: fills the 10 available, remaining 2 killed at once (never rests)", func() {
+			submit(e, engine.OrderRequest{ID: "o9", Account: "carol", Symbol: "AAA", Side: engine.SideBuy, Type: engine.OrderTypeLimit, TIF: engine.TIFIOC, Price: 96, Qty: 12})
+		}},
+		{"carol FOK-buys 50 AAA @97: book depth is gone -> whole order rejected, zero state change", func() {
+			submit(e, engine.OrderRequest{ID: "o10", Account: "carol", Symbol: "AAA", Side: engine.SideBuy, Type: engine.OrderTypeLimit, TIF: engine.TIFFOK, Price: 97, Qty: 50})
+		}},
+		{"bob sells 10 AAA @97, then carol FOK-buys 10 @97 -> depth suffices, fills in one shot", func() {
+			submit(e, engine.OrderRequest{ID: "o11", Account: "bob", Symbol: "AAA", Side: engine.SideSell, Type: engine.OrderTypeLimit, Price: 97, Qty: 10})
+			submit(e, engine.OrderRequest{ID: "o12", Account: "carol", Symbol: "AAA", Side: engine.SideBuy, Type: engine.OrderTypeLimit, TIF: engine.TIFFOK, Price: 97, Qty: 10})
+		}},
 		{"carol tries a 500-size buy @100: notional 50k <= cash but > symbol-position limit (current 35 + 500 = 535 > 200)", func() {
 			submit(e, engine.OrderRequest{ID: "o6", Account: "carol", Symbol: "AAA", Side: engine.SideBuy, Type: engine.OrderTypeLimit, Price: 100, Qty: 500})
 		}},

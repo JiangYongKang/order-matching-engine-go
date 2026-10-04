@@ -1,9 +1,10 @@
 # 本地撮合与执行引擎（Go）
 
 一个零第三方依赖的本地交易模拟引擎：内存订单簿 + 内存账户状态，支持限价/市价
-订单的提交、部分成交、撤销、改单，支持账户级/标的级/整体三层风险约束，事件
-持久化到仅追加（append-only）流水文件，可在任意时刻依据流水完整、确定地回放
-与中断恢复；多标的并发提交的结论与按流水顺序逐一执行完全等价。
+订单的提交、部分成交、撤销、改单，支持 GTC/IOC/FOK 三种下单时效，支持账户级/
+标的级/整体三层风险约束，事件持久化到仅追加（append-only）流水文件，可在任意
+时刻依据流水完整、确定地回放与中断恢复；多标的并发提交的结论与按流水顺序逐一
+执行完全等价。
 
 - 语言：Go 1.25，仅标准库
 - 持久化：二进制分帧（magic + length + CRC32 + gob payload），每条事件
@@ -16,10 +17,27 @@
 
 | 类型 | 价格 | 行为 |
 | --- | --- | --- |
-| 限价单 `LIMIT` | 必须为正整数 | 能成交立即成交；剩余数量进入订单簿挂单 |
+| 限价单 `LIMIT` | 必须为正整数 | 能成交立即成交；剩余数量按时效指令处理（默认挂单） |
 | 市价单 `MARKET` | 不允许携带价格 | IOC（Immediate-Or-Cancel）：仅与现有对手盘成交，未成交剩余直接作废，**绝不挂单** |
 
 数量必须为正整数；所有金额/数量均为 `int64`，不使用浮点，保证可复现。
+
+### 1.1.1 时效指令（Time-In-Force，`OrderRequest.TIF`）
+
+| 时效 | 语义 | 终态 |
+| --- | --- | --- |
+| `GTC`（零值，默认） | 限价单剩余量进入订单簿挂单，直到成交或撤销 | `NEW` / `PARTIALLY_FILLED` → `FILLED` / `CANCELED` |
+| `IOC` 立即成交剩余撤销 | 提交瞬间能成交多少算多少，剩余量**在同一原子提交点立即撤销**：绝不挂单、绝不冻结资金/持仓，账户只按实际成交量结算 | 全部成交 → `FILLED`；有剩余（含零成交）→ `CANCELED`，`FilledQty` 可区分成交了多少 |
+| `FOK` 全部成交否则撤销 | 提交时先按当前订单簿测算可成交量：**不足全量则整单以 `FOK_UNFILLABLE` 拒绝**，订单簿、账户占用、订单注册零变化（仅追加一条 `REJECTED` 审计事件）；足够则一次性全部成交，不挂单不冻结 | `FILLED` 或 `REJECTED` |
+
+- IOC/FOK 与限价/市价自由组合（市价单天然 IOC，`TIF` 对市价单仅 `FOK`
+  有额外含义：深度不足整单拒绝）；非法 TIF 值以 `INVALID_TIF` 拒绝。
+- IOC/FOK 均不挂单，因此**不影响任何价位的时间优先队列**；自成交防护、
+  资金/持仓校验、风险限额对它们同样生效（挂单敞口类限额对 IOC/FOK 的
+  挂出量按 0 计）。
+- 终态可区分：订单携带 `TerminalCancel` 标记，部分成交后被撤销的订单
+  状态为 `CANCELED`（而非 `FILLED`），与全部成交严格区分；该标记随
+  `ACCEPTED`/`CANCELED` 事件入流水，回放结论与实时一致。
 
 ### 1.2 价格-时间优先
 
@@ -68,13 +86,17 @@
 校验按确定的优先级进行，同一指令永远命中同一个原因：
 
 1. 字段合法性：`EMPTY_ORDER_ID` → `UNKNOWN_ACCOUNT` → `UNKNOWN_SYMBOL`
-   → `INVALID_SIDE` → `INVALID_ORDER_TYPE` → `INVALID_QTY` → `INVALID_PRICE`
+   → `INVALID_SIDE` → `INVALID_ORDER_TYPE` → `INVALID_TIF` → `INVALID_QTY`
+   → `INVALID_PRICE`
 2. `DUPLICATE_ORDER_ID`（含已完结订单与曾被拒绝的 ID）
 3. `UNKNOWN_ACCOUNT`（账户未注册）
-4. 市价单无对手盘：`NO_LIQUIDITY`
-5. `SELF_TRADE`
-6. 资金/持仓：`INSUFFICIENT_FUNDS` / `INSUFFICIENT_SHARES`
-7. 风险限额（见下）
+4. FOK 可成交量不足全量：`FOK_UNFILLABLE`（零状态变化）
+5. 市价单无对手盘：`NO_LIQUIDITY`
+6. `SELF_TRADE`
+7. 资金/持仓：`INSUFFICIENT_FUNDS` / `INSUFFICIENT_SHARES`
+   （IOC/FOK 只按“立即成交部分”的实际成本/数量校验，不为将撤销的剩余量
+   预留）
+8. 风险限额（见下）
 
 ### 2.1 三层限额（`Limit <= 0` 表示不限制）
 
@@ -96,11 +118,11 @@
 
 | 事件 | 含义 |
 | --- | --- |
-| `ACCEPTED` | 订单被接受；携带订单快照与冻结额；其序号即时间优先序号 |
+| `ACCEPTED` | 订单被接受；携带订单快照（含 `TIF` 与 `TerminalCancel`）与冻结额；其序号即时间优先序号。IOC/FOK/市价单冻结额恒为 0、剩余量恒为 0 |
 | `TRADE` | 一笔成交（价格、数量、maker/taker 的订单与账户） |
 | `CANCELED` | 挂单撤销并解冻 |
 | `REPLACED` | 改单；`KeptPriority` 区分同价保序与变价重排 |
-| `REJECTED` | 指令被拒及稳定原因码；无状态迁移 |
+| `REJECTED` | 指令被拒及稳定原因码（含 `FOK_UNFILLABLE`）；无状态迁移 |
 
 一次提交的事件组布局：`ACCEPTED(seq=n), TRADE(n+1..)`（成交事件按吃单顺序）。
 序号保证全局连续无空洞（回放会强校验，断号即判定流水损坏）。
@@ -146,7 +168,7 @@ cmd/demo/       可运行的端到端演示（含拒单/风险/自成交/回放�
 ```bash
 go build ./...
 go vet ./...
-go test ./... -race -count=1 -v          # 全部单测（含竞态检测）
+go test ./... -race -count=3 -v          # 全部单测（含竞态检测，连跑 3 轮防回归）
 go run ./cmd/demo                        # 端到端演示：跑指令、打印流水、关引擎、回放对账
 # 中断恢复能力由 TestRecoveryContinuesAfterRestart 覆盖（重启引擎后继续提交并核对）
 ```
@@ -160,10 +182,15 @@ go run ./cmd/demo                        # 端到端演示：跑指令、打印�
 | `TestReplaceSamePriceKeepsPriority` / `TestReplacePriceChange` | 改单保序、缩量放量、变价穿越、失败不留中间态 |
 | `TestRejectedInstructionsLeaveNoTrace` | 各类非法/资金不足指令拒绝后账户与订单簿零变化 |
 | `TestMarketOrderIOC` | 市价 IOC：无流动性拒绝、部分成交不挂单 |
+| `TestIOCLimitPartialFillKillsRemainder` / `TestIOCLimitFullFillAndNoCross` / `TestIOCSellPartialSettlesOnlyFilledShares` | IOC 限价：部分成交即撤剩余（不挂单不冻结）、全成/零成交终态可区分、卖单只按实成交量结算 |
+| `TestFOKLimitFullyFillable` / `TestFOKUnfillableLeavesNoTrace` / `TestFOKSelfTradeRejected` | FOK：深度足够一次全成；深度不足整单拒绝且簿/账户/注册零变化（限价+市价+卖单）；自成交拒绝 |
+| `TestInvalidTIFRejected` | 非法时效值静态拒绝 |
+| `TestLimitPartialRestThenFillAndCancel` | 普通限价单部分成交后余量挂原价位、后续被继续成交/被撤，逐步断言订单状态+订单簿+账户占用三方一致 |
+| `TestTIFReplayConsistency` | IOC/FOK 流水回放与实时一致、重复回放幂等、重启恢复后继续交易 |
 | `TestSingleOrderNotionalLimit` / `TestGrossExposureLimit` / `TestSymbolPositionLimit` / `TestGlobalExposureLimit` | 三层风险限额边界（等值放行、超限拒绝，错误消息含判定依据） |
 | `TestSelfTradeRejectedWithoutFilling` | 自成交整单拒绝且无任何状态变化 |
 | `TestInsufficientFundsAndShares` | 现金/持仓不足的边界（恰好足额放行） |
-| `TestConcurrentMultiSymbolEquivalentToReplay` | 多标的并发提交 + 撤改单，线上状态与顺序回放逐字段一致 |
+| `TestConcurrentMultiSymbolEquivalentToReplay` | 多标的并发提交（混入 IOC/FOK）+ 撤改单，线上状态与顺序回放逐字段一致 |
 | `TestCancelAmendRace` | 同一订单“成交/撤销/改单”三方竞态 200 轮：不重复成交、回放一致、现金守恒 |
 | `TestReplayEqualsIncremental` / `TestRecoveryContinuesAfterRestart` | 流水回放对账、重启恢复、重复回放幂等 |
 | `TestTornTailTruncation` / `TestTruncatedPayloadKeepsGoodFrames` | 中断残缺尾帧精确截断与恢复后续写 |

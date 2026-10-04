@@ -20,6 +20,9 @@ func staticValidate(req OrderRequest) *RejectError {
 	if req.Type != OrderTypeLimit && req.Type != OrderTypeMarket {
 		return rejectf(RejectInvalidOrderType, "order type %d is invalid", req.Type)
 	}
+	if req.TIF != TIFGTC && req.TIF != TIFIOC && req.TIF != TIFFOK {
+		return rejectf(RejectInvalidTIF, "time-in-force %d is invalid", req.TIF)
+	}
 	if req.Qty <= 0 {
 		return rejectf(RejectInvalidQty, "quantity %d must be positive", req.Qty)
 	}
@@ -127,7 +130,15 @@ func (e *Engine) commitSubmit(p *settlementPlan) (*SubmitResult, error) {
 	}
 	restQty := req.Qty - fillQty
 	isLimit := req.Type == OrderTypeLimit
+	// rests: only a GTC limit remainder may enter the book. IOC/FOK and all
+	// market orders are fill-now-or-done and never rest or reserve.
+	rests := isLimit && req.TIF == TIFGTC && restQty > 0
 
+	if req.TIF == TIFFOK && fillQty < req.Qty {
+		return e.finishSubmitRejectLocked(res, req, rejectf(RejectFOKUnfillable,
+			"FOK order %s %s %s qty=%d can only fill %d against current book",
+			req.ID, req.Side, req.Symbol, req.Qty, fillQty), now)
+	}
 	if req.Type == OrderTypeMarket && fillQty == 0 {
 		return e.finishSubmitRejectLocked(res, req, rejectf(RejectNoLiquidity,
 			"market order %s %s qty=%d found no opposing liquidity", req.ID, req.Side, req.Qty), now)
@@ -139,30 +150,30 @@ func (e *Engine) commitSubmit(p *settlementPlan) (*SubmitResult, error) {
 
 	acct := v.ledger.accounts[req.Account]
 	switch {
-	case req.Side == SideBuy && isLimit:
+	case req.Side == SideBuy && rests:
 		need := fillCost + req.Price*restQty
 		if acct.availCash() < need {
 			return e.finishSubmitRejectLocked(res, req, rejectf(RejectInsufficientFunds,
 				"buy %s needs cash %d (fill cost %d + reserve %d) but available is %d",
 				req.Symbol, need, fillCost, req.Price*restQty, acct.availCash()), now)
 		}
-	case req.Side == SideSell && isLimit:
+	case req.Side == SideBuy: // market/IOC/FOK: cost accumulates only at matched prices
+		if acct.availCash() < fillCost {
+			return e.finishSubmitRejectLocked(res, req, rejectf(RejectInsufficientFunds,
+				"buy %s (%s) needs cash %d for immediate fills but available is %d",
+				req.Symbol, req.TIF, fillCost, acct.availCash()), now)
+		}
+	case req.Side == SideSell && rests:
 		if acct.availShares(req.Symbol) < req.Qty {
 			return e.finishSubmitRejectLocked(res, req, rejectf(RejectInsufficientShares,
 				"sell %s needs %d shares but available is %d",
 				req.Symbol, req.Qty, acct.availShares(req.Symbol)), now)
 		}
-	case req.Side == SideBuy: // market buy: cost accumulated only at matched prices
-		if acct.availCash() < fillCost {
-			return e.finishSubmitRejectLocked(res, req, rejectf(RejectInsufficientFunds,
-				"market buy %s needs cash %d but available is %d",
-				req.Symbol, fillCost, acct.availCash()), now)
-		}
-	case req.Side == SideSell: // market sell
+	case req.Side == SideSell: // market/IOC/FOK sell: only filled shares settle
 		if acct.availShares(req.Symbol) < fillQty {
 			return e.finishSubmitRejectLocked(res, req, rejectf(RejectInsufficientShares,
-				"market sell %s needs %d shares but available is %d",
-				req.Symbol, fillQty, acct.availShares(req.Symbol)), now)
+				"sell %s (%s) needs %d shares for immediate fills but available is %d",
+				req.Symbol, req.TIF, fillQty, acct.availShares(req.Symbol)), now)
 		}
 	}
 
@@ -173,7 +184,7 @@ func (e *Engine) commitSubmit(p *settlementPlan) (*SubmitResult, error) {
 		valuationPrice = trades[0].price
 	}
 	riskRestQty := int64(0)
-	if isLimit {
+	if rests {
 		riskRestQty = restQty
 	}
 	if rj := e.risk.Check(riskInputs{
@@ -189,19 +200,23 @@ func (e *Engine) commitSubmit(p *settlementPlan) (*SubmitResult, error) {
 	prioritySeq := e.allocSeqLocked()
 	taker := &Order{
 		ID: req.ID, Account: req.Account, Symbol: req.Symbol, Side: req.Side,
-		Type: req.Type, Price: req.Price, Qty: req.Qty,
+		Type: req.Type, TIF: req.TIF, Price: req.Price, Qty: req.Qty,
 		OpenQty: restQty, FilledQty: 0, PrioritySeq: prioritySeq,
 		CreatedAt: now,
 	}
-	if !isLimit {
-		taker.OpenQty = 0 // market leftovers are IOC-canceled, never rest
+	if !rests {
+		// IOC/FOK/market leftovers never rest; the remainder is killed at the
+		// same atomic commit point, so the terminal state stays
+		// distinguishable from a full fill.
+		taker.OpenQty = 0
+		taker.TerminalCancel = restQty > 0
 	}
 	accEv := &Event{
 		Seq: prioritySeq, Type: EventAccepted, Time: now,
 		OrderID: req.ID, Order: taker, Account: req.Account, Symbol: req.Symbol,
-		Side: req.Side, OType: req.Type, Price: req.Price, Qty: req.Qty,
+		Side: req.Side, OType: req.Type, TIF: req.TIF, Price: req.Price, Qty: req.Qty,
 	}
-	if isLimit && restQty > 0 {
+	if rests {
 		if req.Side == SideBuy {
 			accEv.ReservedCash = req.Price * restQty
 		} else {
@@ -228,14 +243,14 @@ func (e *Engine) commitSubmit(p *settlementPlan) (*SubmitResult, error) {
 	res.Order = v.orders[req.ID]
 	res.Trades = resTrades
 	res.Seq = prioritySeq
-	res.Resting = isLimit && restQty > 0
+	res.Resting = rests
 	switch {
 	case res.Resting:
 		res.Status = res.Order.Status()
 	case fillQty == req.Qty:
 		res.Status = StatusFilled
 	default:
-		res.Status = StatusCanceled // market: partially filled, remainder IOC-canceled
+		res.Status = StatusCanceled // IOC/market: remainder killed at commit
 	}
 	return res, nil
 }
@@ -244,7 +259,7 @@ func (e *Engine) finishSubmitRejectLocked(res *SubmitResult, req OrderRequest, r
 	ev := &Event{
 		Seq: e.allocSeqLocked(), Type: EventRejected, Time: now,
 		OrderID: req.ID, Account: req.Account, Symbol: req.Symbol,
-		Side: req.Side, OType: req.Type, Price: req.Price, Qty: req.Qty,
+		Side: req.Side, OType: req.Type, TIF: req.TIF, Price: req.Price, Qty: req.Qty,
 		Reason: string(rj.Reason),
 	}
 	if err := e.persistAndApplyLocked([]*Event{ev}); err != nil {

@@ -91,7 +91,16 @@ func TestConcurrentMultiSymbolEquivalentToReplay(t *testing.T) {
 				if k%4 == 0 {
 					side = SideSell
 				}
-				r, err := e.Submit(OrderRequest{ID: id, Account: acct, Symbol: sym, Side: side, Type: OrderTypeLimit, Price: price, Qty: 2})
+				// Mix time-in-force instructions into the storm: IOC/FOK must
+				// stay equivalent to sequential execution in journal order.
+				tif := TIFGTC
+				switch k % 5 {
+				case 1:
+					tif = TIFIOC
+				case 2:
+					tif = TIFFOK
+				}
+				r, err := e.Submit(OrderRequest{ID: id, Account: acct, Symbol: sym, Side: side, Type: OrderTypeLimit, TIF: tif, Price: price, Qty: 2})
 				if err != nil {
 					t.Errorf("submit %s: %v", id, err)
 					return

@@ -133,6 +133,7 @@ func (v *replayView) applyCanceled(ev *Event) error {
 	v.book(o.Symbol).Remove(o)
 	v.ledger.removeOpenOrder(o.ID)
 	o.OpenQty = 0
+	o.TerminalCancel = true
 	return nil
 }
 
