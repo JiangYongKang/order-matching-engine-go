@@ -22,6 +22,8 @@ const (
 	RejectRiskSymbolPosition RejectReason = "RISK_SYMBOL_POSITION_LIMIT"
 	RejectRiskGlobalExposure RejectReason = "RISK_GLOBAL_EXPOSURE_LIMIT"
 	RejectNoLiquidity        RejectReason = "NO_LIQUIDITY"
+	RejectWouldNotFill       RejectReason = "WOULD_NOT_FILL"
+	RejectInvalidTIF         RejectReason = "INVALID_TIME_IN_FORCE"
 	RejectOrderNotFound      RejectReason = "ORDER_NOT_FOUND"
 	RejectOrderClosed        RejectReason = "ORDER_NOT_ACTIVE"
 	RejectInvalidReplace     RejectReason = "INVALID_REPLACE"

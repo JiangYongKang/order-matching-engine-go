@@ -42,6 +42,38 @@ func (t OrderType) String() string {
 	}
 }
 
+// TimeInForce is the order's time-in-force / immediacy instruction.
+type TimeInForce int
+
+const (
+	// TIFDefault keeps the historical behavior: GTC for limit orders and IOC
+	// for market orders.
+	TIFDefault TimeInForce = 0
+	// TIFGTC (Good-Till-Canceled): the unfilled remainder rests in the book.
+	TIFGTC TimeInForce = 1
+	// TIFIOC (Immediate-Or-Cancel, "fill-and-kill"): trade as much as possible
+	// immediately; the unfilled remainder is canceled and never rests.
+	TIFIOC TimeInForce = 2
+	// TIFFOK (Fill-Or-Kill): the order must be fully fillable immediately;
+	// otherwise it is rejected as a whole without any fill.
+	TIFFOK TimeInForce = 3
+)
+
+func (f TimeInForce) String() string {
+	switch f {
+	case TIFDefault:
+		return "DEFAULT"
+	case TIFGTC:
+		return "GTC"
+	case TIFIOC:
+		return "IOC"
+	case TIFFOK:
+		return "FOK"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // OrderStatus is the lifecycle state of an order.
 type OrderStatus int
 
@@ -77,16 +109,27 @@ type Order struct {
 	Symbol      string
 	Side        Side
 	Type        OrderType
-	Price       int64 // limit price; 0 for market orders
-	Qty         int64 // original quantity
-	OpenQty     int64 // unfilled quantity
+	TIF         TimeInForce // effective time in force (never TIFDefault internally)
+	Price       int64       // limit price; 0 for market orders
+	Qty         int64       // original quantity
+	OpenQty     int64       // unfilled quantity
 	FilledQty   int64
 	PrioritySeq int64 // global monotonic sequence defining time priority
 	CreatedAt   time.Time
+
+	// terminal records a lifecycle end that OpenQty/FilledQty alone cannot
+	// express: an immediate (IOC/market) remainder canceled after zero/partial
+	// fills, or an explicit cancel. Zero means the order rests or stays open.
+	// Unexported: it is carried in the journaled Order snapshot (gob encodes
+	// private fields of encoded structs) and rebuilt by event replay.
+	terminal OrderStatus
 }
 
 // Status derives the status of the order.
 func (o *Order) Status() OrderStatus {
+	if o.terminal != 0 {
+		return o.terminal
+	}
 	switch {
 	case o.OpenQty == 0 && o.FilledQty > 0:
 		return StatusFilled
@@ -111,6 +154,9 @@ type OrderRequest struct {
 	Type    OrderType
 	Price   int64 // required (positive) for limit orders; ignored for market
 	Qty     int64
+	// TIF is the time in force. TIFDefault keeps historical behavior (GTC for
+	// limit, IOC for market). Market orders accept IOC/FOK but never GTC.
+	TIF TimeInForce
 }
 
 // Trade records one fill between a taker (incoming) order and a resting maker.
@@ -161,6 +207,12 @@ const (
 	EventCanceled
 	EventReplaced
 	EventRejected
+	// EventExpired records the unfilled remainder of an immediate (IOC /
+	// market) order being canceled at submission time. It never rested, so no
+	// reservation is released and the book is untouched; it exists so the
+	// full submit->fills->expire lifecycle is visible in (and replayed from)
+	// the journal and the final CANCELED status is reconstructable.
+	EventExpired
 )
 
 func (t EventType) String() string {
@@ -175,6 +227,8 @@ func (t EventType) String() string {
 		return "REPLACED"
 	case EventRejected:
 		return "REJECTED"
+	case EventExpired:
+		return "EXPIRED"
 	default:
 		return "UNKNOWN"
 	}
@@ -186,7 +240,7 @@ type Event struct {
 	Type EventType
 	Time time.Time
 
-	// Accepted / Rejected / Canceled / Replaced identify an order.
+	// Accepted / Rejected / Canceled / Replaced / Expired identify an order.
 	OrderID string
 
 	// Accepted / Rejected fields.
@@ -208,6 +262,10 @@ type Event struct {
 
 	// Replaced fields.
 	KeptPriority bool
+
+	// Expired fields: canceled (never-rested) remainder quantity of an
+	// immediate IOC/market order.
+	LeftoverQty int64
 }
 
 // AccountState is the public snapshot of an account.

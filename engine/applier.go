@@ -47,6 +47,8 @@ func (v *replayView) applyEvent(ev *Event) error {
 		return v.applyCanceled(ev)
 	case EventReplaced:
 		return v.applyReplaced(ev)
+	case EventExpired:
+		return v.applyExpired(ev)
 	case EventRejected:
 		v.rejected[ev.OrderID] = struct{}{}
 		return nil
@@ -105,10 +107,14 @@ func (v *replayView) applyTrade(ev *Event) error {
 	maker.OpenQty -= t.Qty
 	taker.FilledQty += t.Qty
 	if taker.Qty > 0 && taker.OpenQty > 0 {
+		// Resting GTC taker crossing in its own leg: track its remainder.
+		// Immediate (market/IOC/FOK) takers rest nothing and keep OpenQty 0
+		// from acceptance; their remainder is closed by a later Expired event.
 		taker.OpenQty -= t.Qty
 	}
-	if taker.Qty > 0 && taker.OpenQty == 0 {
-		// Resting limit taker fully consumed by its own crossing leg.
+	if taker.Qty > 0 && taker.OpenQty == 0 && taker.terminal == 0 {
+		// Resting limit taker fully consumed by its own crossing leg. For an
+		// immediate taker the order is not in the book, so Remove is a no-op.
 		v.book(taker.Symbol).Remove(taker)
 		v.ledger.removeOpenOrder(taker.ID)
 	}
@@ -133,6 +139,30 @@ func (v *replayView) applyCanceled(ev *Event) error {
 	v.book(o.Symbol).Remove(o)
 	v.ledger.removeOpenOrder(o.ID)
 	o.OpenQty = 0
+	o.terminal = StatusCanceled
+	return nil
+}
+
+// applyExpired closes an immediate (IOC/market) order whose unfilled
+// remainder was canceled at submission. Such an order never rested and froze
+// nothing, so the book and ledger are untouched; the event only reconstructs
+// its final CANCELED status (distinguishing "partially filled then expired"
+// from a fully filled order after replay/recovery). LeftoverQty must match
+// the order's remaining open quantity, which catches a corrupted stream.
+func (v *replayView) applyExpired(ev *Event) error {
+	o := v.orders[ev.OrderID]
+	if o == nil {
+		return fmt.Errorf("expired event %d: order %s unknown", ev.Seq, ev.OrderID)
+	}
+	if o.terminal != 0 {
+		return fmt.Errorf("expired event %d: order %s already terminal (%s)", ev.Seq, ev.OrderID, o.terminal)
+	}
+	if ev.LeftoverQty <= 0 || ev.LeftoverQty != o.Qty-o.FilledQty-o.OpenQty {
+		return fmt.Errorf("expired event %d: leftover %d does not match unfilled qty %d of %s",
+			ev.Seq, ev.LeftoverQty, o.Qty-o.FilledQty-o.OpenQty, ev.OrderID)
+	}
+	o.OpenQty = 0
+	o.terminal = StatusCanceled
 	return nil
 }
 

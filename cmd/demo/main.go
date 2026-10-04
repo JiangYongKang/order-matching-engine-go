@@ -75,6 +75,14 @@ func main() {
 		{"carol limit-buys 5 AAA @96 -> fills the early o2 remainder first", func() {
 			submit(e, engine.OrderRequest{ID: "o5", Account: "carol", Symbol: "AAA", Side: engine.SideBuy, Type: engine.OrderTypeLimit, Price: 96, Qty: 5})
 		}},
+		{"carol IOC-buys 12 AAA @96: o2+o4 supply 10, leftover 2 expires (never rests)", func() {
+			submit(e, engine.OrderRequest{ID: "o5b", Account: "carol", Symbol: "AAA", Side: engine.SideBuy,
+				Type: engine.OrderTypeLimit, Price: 96, Qty: 12, TIF: engine.TIFIOC})
+		}},
+		{"carol FOK-buys 50 AAA @96: nothing left at 96 -> WOULD_NOT_FILL, zero effect", func() {
+			submit(e, engine.OrderRequest{ID: "o5c", Account: "carol", Symbol: "AAA", Side: engine.SideBuy,
+				Type: engine.OrderTypeLimit, Price: 96, Qty: 50, TIF: engine.TIFFOK})
+		}},
 		{"carol tries a 500-size buy @100: notional 50k <= cash but > symbol-position limit (current 35 + 500 = 535 > 200)", func() {
 			submit(e, engine.OrderRequest{ID: "o6", Account: "carol", Symbol: "AAA", Side: engine.SideBuy, Type: engine.OrderTypeLimit, Price: 100, Qty: 500})
 		}},
